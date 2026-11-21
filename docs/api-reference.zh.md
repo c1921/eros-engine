@@ -81,6 +81,12 @@ session 时忽略。
 
 ### `POST /comp/chat/{session_id}/message/stream`
 
+普通 1:1 文本回复默认按一到三个气泡发送。每个气泡有独立的 `message_id`，
+输入延迟结束后发送 `meta → delta → done`。首条抵扣已花在生成和过滤上的时间。
+最后一个气泡携带模型用量，随后发送整轮唯一的 `final`。发送期间重复提交同一个
+`client_msg_id` 会返回处理中。全部发送后，重放会立即返回已落库的气泡。部署可设
+`CHAT_REPLY_PACING_DISABLED=1` 恢复逐 token 输出。
+
 流式聊天，返回 `text/event-stream`，使用 `meta → delta* → done → final`
 状态机（详见 [SSE streaming chat 0.2 设计文档](superpowers/specs/2026-05-19-sse-streaming-chat-0.2-design.md)）。
 
@@ -124,11 +130,11 @@ data: {"type":"final","filtered":false,"prompt_injected":null,"tier":null,"retri
 
 **失败轮次在历史里的样子。** 以 `error` 结束的轮次没有生效：亲密度没有变化，动作轮次的用户行不带 `response`。通常还会留下一条 `system_error` 通知，它的 `user_message_id` 指向那条用户行。如果轮次失败之前已经有失败的回复尝试落库，就不留通知：回复链用尽时没有兜底话术可发（没有配置，或者整条链都是 BYOK，见 [byok.zh.md](byok.zh.md)），或者某一跳失败之后整轮超时。这时队列行按 `done` 结算，历史里保留每次失败尝试的 assistant 行，内容为空，或是它流出过的半截文本。async 端点的轮次走同一条管线，但最多可以尝试 `CHAT_QUEUE_MAX_ATTEMPTS` 次：还没有任何回复尝试落库就失败的会重试，只有最后一次尝试按上面的方式结算；已经有回复尝试落库之后才失败的不再重试。
 
-**过滤轮次也是流式的。** 当本轮的 LLM `output_filter` 生效时（见
-[model-config.zh.md](model-config.zh.md)），改写结果会以普通的 `delta` 帧
-陆续送到客户端，不是最后一次性给一整块——引擎会把过滤模型输出的前 120 个
+**流式输出过滤。** 使用逐 token 输出的轮次中，LLM `output_filter` 的改写结果会以普通的 `delta` 帧
+陆续送到客户端。引擎会把过滤模型输出的前 120 个
 字符先攒住做校验，通过之后再把后续内容边生成边推给客户端。如果某次尝试
-已经吐出文本之后才失败，本轮会用一个新气泡顶替它，而不是接着写：
+已经吐出文本之后才失败，本轮会用一个新气泡顶替它。按气泡发送的轮次会在过滤完成后拆分最终文本。
+[模型配置](model-config.zh.md)
 
 ```text
 data: {"type":"done","message_id":"01J...","truncated":true,"usage":null,"generation_id":null}
@@ -575,6 +581,9 @@ stream 客户端——事后可通过
 见 [byoc.zh.md](byoc.zh.md) 和 [BYOC](#自带角色byoc)。
 
 ### `POST /v2/comp/session/{session_id}/message/async`
+
+普通 1:1 文本回复逐气泡落库，Supabase Realtime 订阅者会按顺序收到每条消息。
+排队时间计入首条气泡的延迟预算。
 
 只入队的对话轮——上面流式端点的异步替代方案，给无法保持 SSE 连接的调用方用（bot
 网关、后台发送器）。请求体、字段校验与鉴权/归属/`wrong_channel` 检查都与

@@ -708,6 +708,7 @@ pub struct ServerConfig {
     /// prompt shape. Independent of `CHAT_ECHO_CANCELLATION_DISABLED`, which
     /// governs duplicate dropping.
     pub chat_noise_cancellation_disabled: bool,
+    pub chat_reply_pacing_disabled: bool,
     /// World memories subsystem configuration.
     pub world: WorldConfig,
     /// Async chat-turn queue worker configuration (`CHAT_QUEUE_*` env vars).
@@ -788,6 +789,9 @@ impl ServerConfig {
                 std::env::var("CHAT_NOISE_CANCELLATION_DISABLED")
                     .ok()
                     .as_deref(),
+            ),
+            chat_reply_pacing_disabled: parse_bool_flag(
+                std::env::var("CHAT_REPLY_PACING_DISABLED").ok().as_deref(),
             ),
             world: parse_world_config(
                 std::env::var("WORLD_DISABLED").ok().as_deref(),

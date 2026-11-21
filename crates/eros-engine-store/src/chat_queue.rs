@@ -7,10 +7,34 @@ use std::time::Duration;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::chat::{upsert_user_message_in_tx, ReplayMessage, UpsertUserOutcome};
+use crate::chat::{
+    insert_assistant_row_in_tx, upsert_user_message_in_tx, AssistantInsert, ReplayMessage,
+    UpsertUserOutcome,
+};
 
 pub struct ChatQueueRepo<'a> {
     pub pool: &'a PgPool,
+}
+
+pub const REPLY_DELIVERY_MODEL_KEY: &str = "reply_delivery_model";
+
+/// The claim's attempt number fences writes from a worker that lost its claim.
+#[derive(Debug, Clone, Copy)]
+pub struct ReplyDeliveryClaim {
+    pub user_message_id: Uuid,
+    pub attempt: i32,
+}
+
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+pub struct ScheduledBubble {
+    pub row: AssistantInsert,
+    pub delay_ms: u64,
+}
+
+pub enum NextBubble {
+    Complete,
+    Wait(Duration),
+    Published(Box<AssistantInsert>),
 }
 
 /// Outcome of an enqueue attempt, resolved against both the message table's
@@ -61,6 +85,113 @@ pub enum ClaimedEnqueueOutcome {
 }
 
 impl<'a> ChatQueueRepo<'a> {
+    pub async fn stage_reply(
+        &self,
+        claim: ReplyDeliveryClaim,
+        bubbles: &[ScheduledBubble],
+    ) -> Result<(), sqlx::Error> {
+        let first = bubbles
+            .first()
+            .expect("a staged reply has at least one bubble");
+        let result = sqlx::query(
+            "UPDATE engine.chat_turn_queue SET reply_delivery = $3, \
+                 reply_due_at = clock_timestamp() + $4::double precision * interval '1 millisecond' \
+             WHERE user_message_id = $1 AND attempts = $2 AND status = 'claimed' \
+               AND reply_delivery IS NULL",
+        )
+        .bind(claim.user_message_id)
+        .bind(claim.attempt)
+        .bind(sqlx::types::Json(bubbles))
+        .bind(first.delay_ms as f64)
+        .execute(self.pool)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Err(sqlx::Error::RowNotFound);
+        }
+        Ok(())
+    }
+
+    /// Check the due time on the database clock. Publishing a row and removing
+    /// it from the draft share one transaction, so a restart can resume it.
+    pub async fn publish_next_bubble(
+        &self,
+        claim: ReplyDeliveryClaim,
+    ) -> Result<NextBubble, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        let Some((session_id, draft, due_at)) = sqlx::query_as::<
+            _,
+            (
+                Uuid,
+                Option<sqlx::types::Json<Vec<ScheduledBubble>>>,
+                Option<chrono::DateTime<chrono::Utc>>,
+            ),
+        >(
+            "SELECT session_id, reply_delivery, reply_due_at FROM engine.chat_turn_queue \
+             WHERE user_message_id = $1 AND attempts = $2 AND status = 'claimed' FOR UPDATE",
+        )
+        .bind(claim.user_message_id)
+        .bind(claim.attempt)
+        .fetch_optional(&mut *tx)
+        .await?
+        else {
+            return Err(sqlx::Error::RowNotFound);
+        };
+        let (Some(sqlx::types::Json(mut bubbles)), Some(due_at)) = (draft, due_at) else {
+            tx.commit().await?;
+            return Ok(NextBubble::Complete);
+        };
+        let now: chrono::DateTime<chrono::Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
+            .fetch_one(&mut *tx)
+            .await?;
+        if let Ok(remaining) = (due_at - now).to_std() {
+            tx.commit().await?;
+            return Ok(NextBubble::Wait(remaining));
+        }
+
+        let bubble = bubbles.remove(0);
+        insert_assistant_row_in_tx(&mut tx, session_id, claim.user_message_id, &bubble.row).await?;
+        sqlx::query("UPDATE engine.chat_sessions SET last_active_at = now() WHERE id = $1")
+            .bind(session_id)
+            .execute(&mut *tx)
+            .await?;
+        let next_delay = bubbles.first().map(|next| next.delay_ms as f64);
+        sqlx::query(
+            "UPDATE engine.chat_turn_queue SET reply_delivery = $2, \
+                 reply_due_at = clock_timestamp() + $3::double precision * interval '1 millisecond' \
+             WHERE user_message_id = $1",
+        )
+        .bind(claim.user_message_id)
+        .bind(next_delay.map(|_| sqlx::types::Json(bubbles)))
+        .bind(next_delay)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(NextBubble::Published(Box::new(bubble.row)))
+    }
+
+    pub async fn has_staged_reply(&self, user_message_id: Uuid) -> Result<bool, sqlx::Error> {
+        sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM engine.chat_turn_queue \
+                            WHERE user_message_id = $1 AND reply_delivery IS NOT NULL)",
+        )
+        .bind(user_message_id)
+        .fetch_one(self.pool)
+        .await
+    }
+
+    pub async fn release_staged_reply(&self, turn: &ClaimedTurn) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "UPDATE engine.chat_turn_queue \
+             SET status = 'pending', claimed_at = NULL, last_error = 'reply delivery interrupted' \
+             WHERE id = $1 AND attempts = $2 AND status = 'claimed' AND reply_delivery IS NOT NULL",
+        )
+        .bind(turn.queue_id)
+        .bind(turn.attempts)
+        .execute(self.pool)
+        .await?;
+        Ok(())
+    }
+
     /// User row + queue row in ONE transaction. A user row without a queue row
     /// would be a message in history nothing will ever answer — the exact hole
     /// the spec forbids (§4 Atomicity).
@@ -251,7 +382,8 @@ impl<'a> ChatQueueRepo<'a> {
                    AND q.id = ( \
                        SELECT q2.id FROM engine.chat_turn_queue q2 \
                        WHERE q2.session_id = q.session_id AND q2.status = 'pending' \
-                       ORDER BY q2.created_at DESC, q2.id DESC LIMIT 1) \
+                       ORDER BY (q2.reply_delivery IS NOT NULL) DESC, \
+                                q2.created_at DESC, q2.id DESC LIMIT 1) \
                  ORDER BY q.created_at ASC \
                  LIMIT 1 \
                  FOR UPDATE SKIP LOCKED \
@@ -275,7 +407,7 @@ impl<'a> ChatQueueRepo<'a> {
     }
 
     pub async fn mark_done(&self, queue_id: Uuid) -> Result<(), sqlx::Error> {
-        sqlx::query("UPDATE engine.chat_turn_queue SET status = 'done' WHERE id = $1")
+        sqlx::query("UPDATE engine.chat_turn_queue SET status = 'done' WHERE id = $1 AND reply_delivery IS NULL")
             .bind(queue_id)
             .execute(self.pool)
             .await?;
@@ -360,12 +492,26 @@ impl<'a> ChatQueueRepo<'a> {
     ) -> Result<Vec<ReapedTurn>, sqlx::Error> {
         let stale_secs = stale.as_secs_f64();
         let mut tx = self.pool.begin().await?;
+        // The final bubble can commit just before its driver dies. A cleared
+        // draft plus a delivered bubble distinguishes that from failure.
+        sqlx::query(
+            "UPDATE engine.chat_turn_queue q SET status = 'done' \
+             WHERE q.status = 'claimed' AND q.reply_delivery IS NULL \
+               AND q.claimed_at < now() - make_interval(secs => $1::float8) \
+               AND EXISTS (SELECT 1 FROM engine.chat_messages m \
+                           WHERE m.user_message_id = q.user_message_id AND m.role = 'assistant' \
+                             AND m.metadata ? $2::text)",
+        )
+        .bind(stale_secs)
+        .bind(REPLY_DELIVERY_MODEL_KEY)
+        .execute(&mut *tx)
+        .await?;
         let failed: Vec<(Uuid, Uuid, Uuid)> = sqlx::query_as(
             "UPDATE engine.chat_turn_queue \
              SET status = 'failed', last_error = 'stale claim: worker died mid-turn' \
              WHERE status = 'claimed' \
                AND claimed_at < now() - make_interval(secs => $1::float8) \
-               AND attempts >= $2 \
+               AND attempts >= $2 AND reply_delivery IS NULL \
              RETURNING id, session_id, user_message_id",
         )
         .bind(stale_secs)
@@ -452,6 +598,125 @@ mod tests {
         .await
         .unwrap();
         (user_id, session_id)
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn staged_reply_recovers_its_tail_without_replaying_partial_history(pool: PgPool) {
+        let (user_id, session_id) = seed_session(&pool).await;
+        let repo = ChatQueueRepo { pool: &pool };
+        let send = || {
+            repo.enqueue_user_message_claimed(
+                session_id,
+                "hi",
+                "01JQ0000000000000000000PACE",
+                "user",
+                None,
+                user_id,
+                &serde_json::Value::Null,
+            )
+        };
+        let ClaimedEnqueueOutcome::Claimed {
+            user_message_id,
+            queue_id,
+        } = send().await.unwrap()
+        else {
+            panic!("expected a new turn");
+        };
+        let claim = ReplyDeliveryClaim {
+            user_message_id,
+            attempt: 1,
+        };
+        let make_bubble = |content: &str, delay_ms| ScheduledBubble {
+            row: AssistantInsert {
+                id: Uuid::new_v4(),
+                content: content.into(),
+                assistant_action_type: "reply".into(),
+                continues_from_message_id: None,
+                truncated: false,
+                generation_id: None,
+                filter_audit: None,
+                metadata: Some(serde_json::json!({ (REPLY_DELIVERY_MODEL_KEY): null })),
+                llm_attempts: None,
+                gateway_errors: None,
+                speaker_session_id: None,
+            },
+            delay_ms,
+        };
+        let bubbles = [make_bubble("第一条", 0), make_bubble("第二条", 60_000)];
+        repo.stage_reply(claim, &bubbles).await.unwrap();
+        let NextBubble::Published(first) = repo.publish_next_bubble(claim).await.unwrap() else {
+            panic!("the first bubble was due immediately");
+        };
+        assert_eq!(first.id, bubbles[0].row.id);
+        assert!(matches!(
+            repo.publish_next_bubble(claim).await.unwrap(),
+            NextBubble::Wait(_)
+        ));
+        assert!(matches!(
+            send().await.unwrap(),
+            ClaimedEnqueueOutcome::DuplicateInProgress { .. }
+        ));
+
+        // Interrupt the final generation attempt with one row already visible.
+        sqlx::query(
+            "UPDATE engine.chat_turn_queue SET claimed_at = now() - interval '1 hour', \
+                     reply_due_at = now() WHERE id = $1",
+        )
+        .bind(queue_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(repo
+            .reap_stale(Duration::from_secs(1), 1, "notice")
+            .await
+            .unwrap()
+            .is_empty());
+        let resumed = repo.claim_next().await.unwrap().unwrap();
+        assert_eq!(resumed.queue_id, queue_id);
+        assert!(matches!(
+            repo.publish_next_bubble(claim).await,
+            Err(sqlx::Error::RowNotFound)
+        ));
+        let resumed_claim = ReplyDeliveryClaim {
+            attempt: resumed.attempts,
+            ..claim
+        };
+        let NextBubble::Published(second) = repo.publish_next_bubble(resumed_claim).await.unwrap()
+        else {
+            panic!("the resumed claim should release the pending row");
+        };
+        assert_eq!(second.id, bubbles[1].row.id);
+        assert!(matches!(
+            repo.publish_next_bubble(resumed_claim).await.unwrap(),
+            NextBubble::Complete
+        ));
+        let ClaimedEnqueueOutcome::Replay {
+            assistant_chain, ..
+        } = send().await.unwrap()
+        else {
+            panic!("the complete reply should replay");
+        };
+        assert_eq!(
+            assistant_chain
+                .iter()
+                .map(|row| row.msg.id)
+                .collect::<Vec<_>>(),
+            [first.id, second.id]
+        );
+        sqlx::query("UPDATE engine.chat_turn_queue SET claimed_at = now() - interval '1 hour' WHERE id = $1")
+            .bind(queue_id).execute(&pool).await.unwrap();
+        assert!(repo
+            .reap_stale(Duration::from_secs(1), 1, "notice")
+            .await
+            .unwrap()
+            .is_empty());
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM engine.chat_turn_queue WHERE id = $1")
+                .bind(queue_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(status, "done");
     }
 
     #[sqlx::test(migrations = "./migrations")]

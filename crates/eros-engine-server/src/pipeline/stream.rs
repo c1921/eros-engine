@@ -484,6 +484,7 @@ pub struct BurstOutcome {
     /// can carry them. Left empty on a fatal `ProtocolFrame::Error` exit,
     /// where the caller returns without reading `outcome` at all.
     pub failures: Vec<eros_engine_llm::failure::AttemptFailure>,
+    paced_reply: Option<eros_engine_store::chat::AssistantInsert>,
 }
 
 /// Per-burst driver: walks the model fallback chain, emits Meta/Delta/Done
@@ -540,6 +541,7 @@ fn drive_chat_burst(
         chain,
         None,
         None,
+        false,
     )
 }
 
@@ -567,6 +569,7 @@ pub(crate) fn drive_chat_burst_for(
     chain: Vec<crate::byok::ChatHop>,
     speaker_session_id: Option<Uuid>,
     tone: Option<eros_engine_core::tone::Tone>,
+    paced: bool,
 ) -> impl futures_util::Stream<Item = ProtocolFrame> + Send + 'static {
     async_stream::stream! {
         let chat_repo = ChatRepo { pool: &state.pool };
@@ -788,7 +791,8 @@ pub(crate) fn drive_chat_burst_for(
                                 }
                             }
                         }
-                        if !truncated && acc.is_empty() {
+                        if !truncated && (acc.is_empty() || (paced && acc.trim().is_empty())) {
+                            acc.clear();
                             empty_completion = true;
                             attempt_outcome = "empty";
                         }
@@ -988,7 +992,9 @@ pub(crate) fn drive_chat_burst_for(
                     },
                     speaker_session_id,
                 };
-                if let Err(e) = chat_repo
+                if paced && !truncated && !persist_content.trim().is_empty() {
+                    outcome.lock().unwrap().paced_reply = Some(row);
+                } else if let Err(e) = chat_repo
                     .insert_assistant_batch(session_id, user_message_id, &[row])
                     .await
                 {
@@ -1272,7 +1278,11 @@ pub(crate) fn drive_chat_burst_for(
                             }
                         }
                     }
-                    if !truncated && acc.is_empty() { empty_completion = true; attempt_outcome = "empty"; }
+                    if !truncated && (acc.is_empty() || (paced && acc.trim().is_empty())) {
+                        acc.clear();
+                        empty_completion = true;
+                        attempt_outcome = "empty";
+                    }
                 }
                 Ok(Err(e)) => {
                     tracing::warn!("stream(filtered): open err: {e}");
@@ -1595,17 +1605,21 @@ pub(crate) fn drive_chat_burst_for(
                             // The filter's rewrite reaches the client as it is
                             // produced; wire framing and id minting stay here.
                             use futures_util::StreamExt as _;
+                            let mut filter_request = (*f).clone();
+                            if paced {
+                                filter_request.filter_prompt.push_str(super::reply_pacing::FILTER_PROMPT);
+                            }
                             let mut events = std::pin::pin!(run_output_filter(
                                 state.clone(),
                                 session_id,
-                                (*f).clone(),
+                                filter_request,
                                 cleaned.clone(),
                             ));
                             let mut served: Option<RunFilterOutcome> = None;
                             let mut failed: Option<FilterFailOpen> = None;
                             while let Some(ev) = events.next().await {
                                 match ev {
-                                    FilterEvent::Delta(text) => {
+                                    FilterEvent::Delta(text) if !paced => {
                                         // First rewrite delta = the client has
                                         // received non-raw output; final.filtered
                                         // reports exactly that fact, so it flips
@@ -1619,7 +1633,7 @@ pub(crate) fn drive_chat_burst_for(
                                             content: text,
                                         };
                                     }
-                                    FilterEvent::AttemptAborted { had_emitted: true } => {
+                                    FilterEvent::AttemptAborted { had_emitted: true } if !paced => {
                                         // Supersede (spec §Message lifecycle):
                                         // close the bubble the dead attempt
                                         // streamed into (meta↔done stays 1:1),
@@ -1646,14 +1660,20 @@ pub(crate) fn drive_chat_burst_for(
                                             speaker_session_id,
                                         };
                                     }
-                                    FilterEvent::AttemptAborted { had_emitted: false } => {}
+                                    FilterEvent::AttemptAborted { .. } | FilterEvent::Delta(_) => {}
                                     FilterEvent::Served(out) => { served = Some(out); }
                                     FilterEvent::FailOpen(fail) => { failed = Some(fail); }
                                 }
                             }
                             match (served, failed) {
                             (Some(out), _) => {
-                                outcome.lock().unwrap().retries_filter = out.retries_filter;
+                                {
+                                    let mut outcome = outcome.lock().unwrap();
+                                    outcome.retries_filter = out.retries_filter;
+                                    if paced {
+                                        outcome.filtered = true;
+                                    }
+                                }
                                 // Fold the regex hit into the LLM filter's triggers.
                                 let mut triggers = if h.is_empty() {
                                     serde_json::Map::new()
@@ -1756,7 +1776,9 @@ pub(crate) fn drive_chat_burst_for(
                 },
                 speaker_session_id,
             };
-            if let Err(e) = chat_repo.insert_assistant_batch(session_id, user_message_id, &[row]).await {
+            if paced && !visible.trim().is_empty() {
+                outcome.lock().unwrap().paced_reply = Some(row);
+            } else if let Err(e) = chat_repo.insert_assistant_batch(session_id, user_message_id, &[row]).await {
                 tracing::warn!("stream(filtered): persist failed: {e}");
             }
             let timing = f_opt
@@ -3568,6 +3590,7 @@ async fn build_input_filter_transcript(
     session_id: Uuid,
     current_user_message_id: Uuid,
 ) -> JudgeTranscript {
+    use super::reply_pacing::{logical_history_window, MAX_REPLY_BUBBLES};
     // Anchored at the driving row: on the queue path a burst can land AFTER
     // it, and a newest-N fetch would show the judge rows from this turn's
     // future (with the row itself buried past the fetch, the exclusion below
@@ -3584,11 +3607,14 @@ async fn build_input_filter_transcript(
         .history_up_to(
             session_id,
             current_user_message_id,
-            INPUT_FILTER_CONTEXT_TURNS + 1,
+            (INPUT_FILTER_CONTEXT_TURNS + 1) * MAX_REPLY_BUBBLES,
         )
         .await
         .unwrap_or_default();
-    fold_transcript(rows, Some(current_user_message_id))
+    fold_transcript(
+        logical_history_window(rows, INPUT_FILTER_CONTEXT_TURNS + 1),
+        Some(current_user_message_id),
+    )
 }
 
 /// The newest `INPUT_FILTER_CONTEXT_TURNS` rows of the session, folded as the
@@ -3596,11 +3622,20 @@ async fn build_input_filter_transcript(
 /// event's, spec 2026-10-26-event-message-image-design.md §4). Best-effort:
 /// empty on a DB error.
 pub(crate) async fn recent_transcript(chat_repo: &ChatRepo<'_>, session_id: Uuid) -> String {
+    use super::reply_pacing::{logical_history_window, MAX_REPLY_BUBBLES};
     let rows = chat_repo
-        .history(session_id, INPUT_FILTER_CONTEXT_TURNS, 0)
+        .history(
+            session_id,
+            INPUT_FILTER_CONTEXT_TURNS * MAX_REPLY_BUBBLES,
+            0,
+        )
         .await
         .unwrap_or_default();
-    fold_transcript(rows, None).transcript
+    fold_transcript(
+        logical_history_window(rows, INPUT_FILTER_CONTEXT_TURNS),
+        None,
+    )
+    .transcript
 }
 
 /// Fold rows (oldest first) into the judge's transcript, leaving out `skip`
@@ -4924,7 +4959,7 @@ pub fn run_stream(
     user_msg: PersistedUserMessage,
     prefetched_persona: Option<eros_engine_core::persona::CompanionPersona>,
 ) -> impl futures_util::Stream<Item = ProtocolFrame> + Send + 'static {
-    run_stream_with(state, user_msg, prefetched_persona, None)
+    run_stream_with(state, user_msg, prefetched_persona, None, None)
 }
 
 /// [`run_stream`] with the turn's BYOK configuration, which replaces the
@@ -4934,6 +4969,7 @@ pub(crate) fn run_stream_with(
     user_msg: PersistedUserMessage,
     prefetched_persona: Option<eros_engine_core::persona::CompanionPersona>,
     byok: Option<std::sync::Arc<crate::byok::ByokTurn>>,
+    pacing: Option<super::reply_pacing::ReplyPacing>,
 ) -> impl futures_util::Stream<Item = ProtocolFrame> + Send + 'static {
     async_stream::stream! {
         let chat_repo = ChatRepo { pool: &state.pool };
@@ -6498,7 +6534,7 @@ pub(crate) fn run_stream_with(
                         Some(&event_lines),
                     ).await
                 };
-                let (req, injected_tags) = match req_res {
+                let (mut req, injected_tags) = match req_res {
                     Ok(r) => r,
                     Err(e) => {
                         // Dropping `compose_handle` here (via the enclosing
@@ -6519,6 +6555,16 @@ pub(crate) fn run_stream_with(
                         return;
                     }
                 };
+                let pacing = pacing.filter(|_| {
+                    !state.config.chat_reply_pacing_disabled
+                        && plan.action_type == ActionType::ReplyText
+                        && user_msg.action.is_none()
+                });
+                if pacing.is_some() {
+                    if let Some(system) = req.messages.iter_mut().find(|m| m.role == "system") {
+                        system.content.push_str(super::reply_pacing::REPLY_PROMPT);
+                    }
+                }
                 // Optional fire-and-forget raw-prompt disk log (PROMPT_LOG_DIR).
                 // Logged once here — before the fallback-model send loop — so a
                 // turn that retries across models still produces exactly one file.
@@ -6590,16 +6636,36 @@ pub(crate) fn run_stream_with(
                     chain,
                     None,
                     tone,
+                    pacing.is_some(),
                 );
                 {
                     use futures_util::StreamExt as _;
                     let mut burst = Box::pin(burst);
+                    let mut buffered = Vec::new();
                     while let Some(frame) = burst.next().await {
+                        if pacing.is_some() {
+                            super::reply_pacing::buffer_frame(&mut buffered, frame);
+                            continue;
+                        }
                         if matches!(frame, ProtocolFrame::Error { .. }) {
                             yield frame;
                             return;
                         }
                         yield frame;
+                    }
+                    if let Some(pacing) = pacing {
+                        let row = outcome.lock().unwrap().paced_reply.take();
+                        let delivery = super::reply_pacing::deliver_reply(
+                            &state.pool, pacing, row, buffered,
+                        );
+                        let mut delivery = std::pin::pin!(delivery);
+                        while let Some(frame) = delivery.next().await {
+                            let error = matches!(frame, ProtocolFrame::Error { .. });
+                            yield frame;
+                            if error {
+                                return;
+                            }
+                        }
                     }
                 }
                 let (produced, did_filter, retries_chat, retries_filter, ghost_fallback, burst_failures) = {
@@ -6921,7 +6987,11 @@ pub fn replay_stream(
                     // model: None — preserve that on replay so idempotent
                     // retries are wire-identical regardless of any
                     // display_override config.
-                    model: row.model.as_deref().and_then(|m| {
+                    model: if let Some(model) = row.msg.metadata.as_ref()
+                        .and_then(|metadata| metadata.get(eros_engine_store::chat_queue::REPLY_DELIVERY_MODEL_KEY))
+                    {
+                        model.as_str().map(str::to_owned)
+                    } else { row.model.as_deref().and_then(|m| {
                         // A BYOK-served row always shows its real id (spec
                         // 2026-10-08 §6.4), as the live stream did.
                         if matches!(
@@ -6933,7 +7003,7 @@ pub fn replay_stream(
                         display_override
                             .as_ref()
                             .and_then(|d| d.display(&eros_engine_llm::provider::bare_model_id(m)))
-                    }),
+                    }) },
                     continues_from: prev_ulid.map(ulid_string),
                     // A replayed group turn keeps its speakers; 1:1 rows have
                     // none, so their frames carry no speaker.

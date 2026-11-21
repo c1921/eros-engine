@@ -88,6 +88,14 @@ session.
 
 ### `POST /comp/chat/{session_id}/message/stream`
 
+Ordinary 1:1 text replies default to one to three bubbles. Each bubble has its
+own `message_id` and sends `meta → delta → done` after its typing delay. The
+first delay credits time already spent generating and filtering the reply. One
+`final` follows the last bubble, which carries the generation usage. Repeating
+the same `client_msg_id` during delivery returns the in-progress response.
+After delivery, replay returns the stored bubbles immediately. Deployments can
+set `CHAT_REPLY_PACING_DISABLED=1` to restore token streaming.
+
 Streaming chat turn. Returns `text/event-stream` with the
 `meta → delta* → done → final` state machine described in the
 [SSE streaming chat 0.2 design spec](superpowers/specs/2026-05-19-sse-streaming-chat-0.2-design.md).
@@ -133,13 +141,13 @@ Frame fields worth noting:
 
 **A failed turn in history.** A turn that ends in `error` did not take effect: affinity did not move, and an action turn's user row carries no `response`. It usually also leaves a `system_error` notice whose `user_message_id` names that user row. It leaves none when a failed reply attempt was already saved before the turn failed: the reply chain ran out with no fallback phrase to serve (none is configured, or the chain is BYOK-only, see [byok.md](byok.md)), or the turn timed out after a hop had already failed. The queue row then settles `done`, and history keeps each failed attempt's assistant row: empty, or the partial text it streamed. An async turn runs the same pipeline but gets up to `CHAT_QUEUE_MAX_ATTEMPTS` attempts: one that fails before any reply attempt was saved is retried, and only its last attempt is settled as above. One that fails after a reply attempt was saved is not retried.
 
-**Filtered turns stream too.** When the resolved LLM `output_filter` arms for
-a turn (see [model-config.md](model-config.md)), the rewrite reaches the
-client as ordinary `delta` frames, not as one block at the end — the engine
+**Streaming output filters.** On turns using token streaming, the resolved
+LLM `output_filter` rewrite reaches the client as ordinary `delta` frames. The engine
 holds back the first 120 characters of the filter model's output long enough
 to validate them, then streams the rest as it arrives. If an attempt fails
 after it has already emitted text, the turn supersedes that bubble instead of
-continuing it:
+continuing it. Paced replies split the final text after the filter finishes.
+[Model configuration](model-config.md)
 
 ```text
 data: {"type":"done","message_id":"01J...","truncated":true,"usage":null,"generation_id":null}
@@ -699,6 +707,10 @@ with `byok`: the card supplies the character, the `byok` block the reply
 model. See [byoc.md](byoc.md) and [BYOC](#bring-your-own-character-byoc).
 
 ### `POST /v2/comp/session/{session_id}/message/async`
+
+Paced 1:1 text replies are written to history one bubble at a time, so Supabase
+Realtime subscribers receive them in order. Time spent in the queue counts
+toward the first bubble's delay.
 
 Enqueue-only chat turn — the async alternative to the stream endpoint above,
 for callers that cannot hold an SSE connection open (bot gateways, background

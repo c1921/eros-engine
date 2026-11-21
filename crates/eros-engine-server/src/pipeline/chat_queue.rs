@@ -16,8 +16,9 @@ use tokio::sync::Semaphore;
 use uuid::Uuid;
 
 use eros_engine_store::chat::ChatRepo;
-use eros_engine_store::chat_queue::{ChatQueueRepo, ClaimedTurn};
+use eros_engine_store::chat_queue::{ChatQueueRepo, ClaimedTurn, ReplyDeliveryClaim};
 
+use crate::pipeline::reply_pacing::{self, ReplyPacing};
 use crate::pipeline::stream::{run_stream_with, PersistedUserMessage, ProtocolFrame};
 use crate::routes::companion_async::QueuedTurnParams;
 use crate::routes::companion_stream::AffinityScopeDto;
@@ -85,10 +86,10 @@ pub(crate) async fn drain_once(
     // claim for up to generation_timeout, and reaping inside that window
     // releases a turn whose original drive is still running — a second claim
     // then drives it concurrently and the two ladders overwrite each other.
-    // claim_stale is the grace AFTER the generation deadline.
+    // claim_stale is the grace after generation and any staged delivery.
     let reaped = repo
         .reap_stale(
-            cfg.generation_timeout + cfg.claim_stale,
+            cfg.generation_timeout + reply_pacing::DELIVERY_TIMEOUT + cfg.claim_stale,
             cfg.max_attempts,
             FAILURE_NOTICE,
         )
@@ -139,11 +140,14 @@ pub(crate) enum SettleMode {
 
 async fn process_turn(state: AppState, turn: ClaimedTurn) {
     let cfg = state.config.chat_queue.clone();
-    let outcome =
-        match tokio::time::timeout(cfg.generation_timeout, drive_turn(&state, &turn, None)).await {
-            Ok(o) => o,
-            Err(_) => TurnOutcome::Failure("generation timeout".into()),
-        };
+    let outcome = match reply_pacing::with_deadline(cfg.generation_timeout, async |ready| {
+        drive_turn(&state, &turn, None, ready).await
+    })
+    .await
+    {
+        Ok(o) => o,
+        Err(timeout) => TurnOutcome::Failure(timeout.message().into()),
+    };
     settle_turn(&state, &turn, outcome, SettleMode::Ladder).await;
     // This session may have a next stacked turn — wake the loop now rather
     // than waiting out a tick.
@@ -166,6 +170,22 @@ pub(crate) async fn settle_turn(
 ) {
     let cfg = &state.config.chat_queue;
     let repo = ChatQueueRepo { pool: &state.pool };
+    match repo.has_staged_reply(turn.user_message_id).await {
+        Ok(true) => {
+            // A delivery failure retries just the undelivered rows, even if
+            // its generation attempt limit has been reached.
+            if let Err(e) = repo.release_staged_reply(turn).await {
+                tracing::warn!(queue_id = %turn.queue_id, "chat-queue: delivery release failed: {e}");
+            }
+            return;
+        }
+        Ok(false) => {}
+        Err(e) if !matches!(outcome, TurnOutcome::Success) => {
+            tracing::warn!(queue_id = %turn.queue_id, "chat-queue: delivery lookup failed: {e}");
+            return;
+        }
+        Err(_) => {}
+    }
     let res = match outcome {
         TurnOutcome::Success => repo.mark_done(turn.queue_id).await,
         TurnOutcome::Unservable(msg) => {
@@ -221,8 +241,9 @@ pub(crate) async fn drive_to_exhaustion(
     persona: Option<eros_engine_core::persona::CompanionPersona>,
     tap: Option<tokio::sync::mpsc::UnboundedSender<ProtocolFrame>>,
     byok: Option<Arc<crate::byok::ByokTurn>>,
+    pacing: ReplyPacing,
 ) -> TurnOutcome {
-    let stream = run_stream_with(state, user_msg, persona, byok);
+    let stream = run_stream_with(state, user_msg, persona, byok, Some(pacing));
     futures_util::pin_mut!(stream);
     let mut done_frames = 0usize;
     let mut last_error: Option<String> = None;
@@ -250,8 +271,28 @@ async fn drive_turn(
     state: &AppState,
     turn: &ClaimedTurn,
     tap: Option<tokio::sync::mpsc::UnboundedSender<ProtocolFrame>>,
+    ready: tokio::sync::oneshot::Sender<()>,
 ) -> TurnOutcome {
     let chat_repo = ChatRepo { pool: &state.pool };
+    let queue_repo = ChatQueueRepo { pool: &state.pool };
+    let claim = ReplyDeliveryClaim {
+        user_message_id: turn.user_message_id,
+        attempt: turn.attempts,
+    };
+    match queue_repo.has_staged_reply(turn.user_message_id).await {
+        Ok(true) => {
+            let _ = ready.send(());
+            loop {
+                match reply_pacing::next_bubble(&queue_repo, claim).await {
+                    Ok(Some(_)) => {}
+                    Ok(None) => return TurnOutcome::Success,
+                    Err(e) => return TurnOutcome::Failure(format!("reply delivery failed: {e}")),
+                }
+            }
+        }
+        Ok(false) => {}
+        Err(e) => return TurnOutcome::Failure(format!("reply delivery lookup failed: {e}")),
+    }
 
     // Replay guard. `run_stream` has none of its own — the stream path's guard
     // lives in the handler, which the worker bypasses — so every re-drive of an
@@ -273,8 +314,16 @@ async fn drive_turn(
         Err(e) => return TurnOutcome::Failure(format!("replay guard failed: {e}")),
     }
 
-    let row: Option<(String, Option<Uuid>, String, bool)> = match sqlx::query_as(
-        "SELECT m.content, s.instance_id, s.channel, COALESCE(pi.byoc_key IS NOT NULL, false) \
+    #[derive(sqlx::FromRow)]
+    struct QueuedUserMessage {
+        content: String,
+        instance_id: Option<Uuid>,
+        channel: String,
+        byoc: bool,
+        sent_at: chrono::DateTime<chrono::Utc>,
+    }
+    let row = match sqlx::query_as::<_, QueuedUserMessage>(
+        "SELECT m.content, s.instance_id, s.channel, pi.byoc_key IS NOT NULL AS byoc, m.sent_at \
          FROM engine.chat_messages m JOIN engine.chat_sessions s ON s.id = m.session_id \
          LEFT JOIN engine.persona_instances pi ON pi.id = s.instance_id \
          WHERE m.id = $1",
@@ -283,20 +332,21 @@ async fn drive_turn(
     .fetch_optional(&state.pool)
     .await
     {
-        Ok(r) => r,
+        Ok(Some(row)) => row,
+        Ok(None) => return TurnOutcome::Failure("user message or instance_id missing".into()),
         Err(e) => return TurnOutcome::Failure(format!("turn load failed: {e}")),
     };
     // A group turn has one attempt, run by its stream handler; a released claim
     // is settled, never re-driven as a 1:1 turn (spec 2026-10-12 group chat §5.7).
-    if matches!(&row, Some((_, _, channel, _)) if channel == "group") {
+    if row.channel == "group" {
         return TurnOutcome::Unservable("group_turn_not_redriven".into());
     }
     // A BYOC turn's card lived only in the memory of the drive that died, and
     // there is no character to fall back to (spec 2026-10-16-byoc §9).
-    if matches!(&row, Some((_, _, _, true))) {
+    if row.byoc {
         return TurnOutcome::Unservable("byoc_unavailable".into());
     }
-    let Some((content, Some(instance_id), _, _)) = row else {
+    let Some(instance_id) = row.instance_id else {
         return TurnOutcome::Failure("user message or instance_id missing".into());
     };
 
@@ -346,7 +396,7 @@ async fn drive_turn(
         session_id: turn.session_id,
         user_id: turn.user_id,
         instance_id,
-        content,
+        content: row.content,
         prompt_traits,
         audit,
         tier: params.tier.clone(),
@@ -366,7 +416,8 @@ async fn drive_turn(
         outfit: params.outfit.clone(),
     };
 
-    drive_to_exhaustion(Arc::new(state.clone()), user_msg, None, tap, None).await
+    let pacing = ReplyPacing::new(claim, params.received_at.unwrap_or(row.sent_at), ready);
+    drive_to_exhaustion(Arc::new(state.clone()), user_msg, None, tap, None, pacing).await
 }
 
 #[cfg(test)]
@@ -458,7 +509,7 @@ mod worker_tests {
             params: Some(serde_json::json!({})),
         };
         let state = crate::routes::companion::test_state(pool.clone());
-        let outcome = drive_turn(&state, &turn, None).await;
+        let outcome = drive_turn(&state, &turn, None, tokio::sync::oneshot::channel().0).await;
         assert!(
             matches!(outcome, TurnOutcome::Unservable(ref m) if m == "group_turn_not_redriven"),
             "{outcome:?}"
@@ -1214,7 +1265,7 @@ data: [DONE]\n\n";
         let turn = repo.claim_next().await.unwrap().unwrap();
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let outcome = drive_turn(&state, &turn, Some(tx)).await;
+        let outcome = drive_turn(&state, &turn, Some(tx), tokio::sync::oneshot::channel().0).await;
         assert!(matches!(outcome, TurnOutcome::Success));
 
         let mut frames = Vec::new();
@@ -1247,7 +1298,7 @@ data: [DONE]\n\n";
 
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<ProtocolFrame>();
         drop(rx); // client disconnected before the first frame
-        let outcome = drive_turn(&state, &turn, Some(tx)).await;
+        let outcome = drive_turn(&state, &turn, Some(tx), tokio::sync::oneshot::channel().0).await;
         assert!(
             matches!(outcome, TurnOutcome::Success),
             "a dead tap must not stop the drive"

@@ -204,7 +204,9 @@ const REPLAY_CHAIN_SQL: &str = "SELECT m.*, g.model AS g_model, g.usage AS g_usa
      FROM engine.chat_messages m \
      LEFT JOIN engine.llm_generations g ON g.generation_id = m.generation_id \
      WHERE m.user_message_id = $1 AND m.role = 'assistant' \
-     ORDER BY m.sent_at ASC";
+       AND NOT EXISTS (SELECT 1 FROM engine.chat_turn_queue q \
+                       WHERE q.user_message_id = $1 AND q.reply_delivery IS NOT NULL) \
+     ORDER BY m.sent_at ASC, m.id ASC";
 
 const SLIM_COLUMNS: &str = "id, role, content, sent_at, client_msg_id, \
      channel, read_at, reaction, reacted_at, \
@@ -903,7 +905,7 @@ impl<'a> ChatRepo<'a> {
 /// `AssistantInsert::filter_audit` and bound into the five `chat_messages`
 /// audit columns. `None` ⇒ all five columns are NULL. See
 /// docs/superpowers/specs/2026-05-26-tip-role-and-filter-audit-design.md §4.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct FilterAudit {
     pub pre_filter_content: String,
     pub filter_model: String,
@@ -913,7 +915,7 @@ pub struct FilterAudit {
 }
 
 /// One assistant row to insert in a burst.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct AssistantInsert {
     pub id: Uuid,
     pub content: String,
@@ -987,7 +989,7 @@ pub enum VoiceUserInsert {
 /// Does NOT begin or commit — the caller owns the transaction boundary.
 /// One assistant row, inside the caller's transaction. The single INSERT both
 /// `insert_assistant_batch` and `insert_instruction_turn` go through.
-async fn insert_assistant_row_in_tx(
+pub(crate) async fn insert_assistant_row_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     session_id: Uuid,
     user_message_id: Uuid,

@@ -1077,24 +1077,34 @@ pub(crate) async fn build_reply_request_with(
             // prompt, and the model answers whatever comes last (#330). Rows
             // the burst's own turns will see are simply not this turn's
             // context yet.
+            use super::reply_pacing::{logical_history_window, MAX_REPLY_BUBBLES};
+            let fetch_limit = HISTORY_WINDOW * MAX_REPLY_BUBBLES;
             let mut rows = chat_repo
-                .history_up_to(session_id, user_message_id, HISTORY_WINDOW)
+                .history_up_to(session_id, user_message_id, fetch_limit)
                 .await?;
             if rows.is_empty() {
                 // Driving row not in this session at all — degrade to
                 // newest-N, matching the pre-anchor behavior for an absent
                 // driving row.
-                rows = chat_repo.history(session_id, HISTORY_WINDOW, 0).await?;
+                rows = chat_repo.history(session_id, fetch_limit, 0).await?;
             }
+            let mut rows = logical_history_window(rows, HISTORY_WINDOW);
             // A date opens knowing what was just said: the slots its own rows
             // leave are filled with the parent's, up to and including her
             // accepting reply (spec §5.2).
             if let Some(a) = &turn.activity {
                 let room = HISTORY_WINDOW - rows.len() as i64;
                 if room > 0 {
-                    let mut earlier = chat_repo
-                        .history_through(a.session_id, a.started_at.unwrap_or(a.created_at), room)
-                        .await?;
+                    let mut earlier = logical_history_window(
+                        chat_repo
+                            .history_through(
+                                a.session_id,
+                                a.started_at.unwrap_or(a.created_at),
+                                room * MAX_REPLY_BUBBLES,
+                            )
+                            .await?,
+                        room,
+                    );
                     earlier.append(&mut rows);
                     rows = earlier;
                 }

@@ -1018,6 +1018,7 @@ pub async fn send_message_stream(
     headers: axum::http::HeaderMap,
     Json(req): Json<StreamSendRequest>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, AppError> {
+    let received_at = chrono::Utc::now();
     // A card is accepted only from the deployment's own server, checked
     // before anything else (spec 2026-10-16-byoc §4).
     if req.character.is_some() {
@@ -1105,6 +1106,7 @@ pub async fn send_message_stream(
 
     let persisted_metadata = build_user_row_metadata(&req, quote.as_ref());
     let params_value = serde_json::to_value(crate::routes::companion_async::QueuedTurnParams {
+        received_at: Some(received_at),
         tier: req.tier.clone(),
         memory_scope: req.memory_scope,
         affinity_scope: req.affinity_scope.clone(),
@@ -1200,30 +1202,51 @@ pub async fn send_message_stream(
                     // on bare EOF, indistinguishable from success, even
                     // though a `system_error` row lands in history.
                     let timeout_tx = tx.clone();
-                    let outcome = match tokio::time::timeout(
+                    let outcome = match crate::pipeline::reply_pacing::with_deadline(
                         drive_state.config.chat_queue.generation_timeout,
-                        crate::pipeline::chat_queue::drive_to_exhaustion(
-                            Arc::new(drive_state.clone()),
-                            user_msg,
-                            Some(persona),
-                            Some(tx),
-                            byok,
-                        ),
+                        async |ready| {
+                            let pacing = crate::pipeline::reply_pacing::ReplyPacing::new(
+                                eros_engine_store::chat_queue::ReplyDeliveryClaim {
+                                    user_message_id,
+                                    attempt: turn.attempts,
+                                },
+                                received_at,
+                                ready,
+                            );
+                            crate::pipeline::chat_queue::drive_to_exhaustion(
+                                Arc::new(drive_state.clone()),
+                                user_msg,
+                                Some(persona),
+                                Some(tx),
+                                byok,
+                                pacing,
+                            )
+                            .await
+                        },
                     )
                     .await
                     {
                         Ok(o) => o,
-                        Err(_) => {
+                        Err(timeout) => {
+                            use crate::pipeline::reply_pacing::DriveTimeout;
+                            let (code, user_message) = match timeout {
+                                DriveTimeout::Generation => {
+                                    (StreamErrorCode::GenerationTimeout, "生成超时，请稍后再试")
+                                }
+                                DriveTimeout::Delivery => {
+                                    (StreamErrorCode::Timeout, "回复发送超时，请稍后再试")
+                                }
+                            };
                             let _ = timeout_tx.send(ProtocolFrame::Error {
-                                code: StreamErrorCode::GenerationTimeout,
+                                code,
                                 retryable: true,
-                                message: "generation timeout".into(),
-                                user_message: "生成超时，请稍后再试".into(),
+                                message: timeout.message().into(),
+                                user_message: user_message.into(),
                                 upstream_status: None,
                                 provider_code: None,
                             });
                             crate::pipeline::chat_queue::TurnOutcome::Failure(
-                                "generation timeout".into(),
+                                timeout.message().into(),
                             )
                         }
                     };
@@ -2229,6 +2252,201 @@ data: [DONE]\n\n";
         assert_eq!(resp.status(), StatusCode::OK);
         let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
         (std::str::from_utf8(&bytes).unwrap().to_string(), session_id)
+    }
+
+    #[sqlx::test(migrations = "../eros-engine-store/migrations")]
+    async fn paced_stream_and_async_publish_the_same_filtered_bubbles(pool: PgPool) {
+        use wiremock::matchers::{body_string_contains, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        let fragments = ["我想说，", "其实这阵子我一直在想，", "上次和你一起在河边散步的那个傍晚真好。那天聊过的事我还记得，也记得天慢慢暗下来的时候，河对面的灯一盏一盏亮了起来。要是哪天我们都刚好有空，我还想再一起走一趟。"];
+        let rewritten = fragments.join("\n\n");
+        let completion = |content: &str, id: &str| {
+            let chunk = json!({
+                "choices":[{"delta":{"content": content}, "finish_reason":"stop"}],
+                "usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}, "id":id
+            });
+            ResponseTemplate::new(200).set_body_raw(
+                format!("data: {chunk}\n\ndata: [DONE]\n\n"),
+                "text/event-stream",
+            )
+        };
+        for (model, response) in [
+            (
+                "pde/judge",
+                completion(r#"{"action":"reply_text","inner_state":""}"#, "judge-gen"),
+            ),
+            ("deepseek/x", completion("未改写的回复", "chat-gen")),
+            ("fast/m", completion(&rewritten, "filter-gen")),
+        ] {
+            Mock::given(wm_path("/api/v1/chat/completions"))
+                .and(body_string_contains(model))
+                .respond_with(response)
+                .mount(&mock)
+                .await;
+        }
+        let user_id = Uuid::new_v4();
+        let instance_id = seed_persona_instance(&pool, user_id).await;
+        let session_id = ChatRepo { pool: &pool }
+            .create_session(user_id, instance_id)
+            .await
+            .unwrap()
+            .id;
+        let mut state = crate::routes::companion::test_state(pool.clone());
+        state.config.chat_reply_pacing_disabled = false;
+        state.model_config = std::sync::Arc::new(
+            eros_engine_llm::model_config::ModelConfig::from_toml_str(
+                "[tasks.chat_companion]\nmodel=\"deepseek/x\"\noutput_filter=true\n\
+             [tasks.pde_decision]\nmodel=\"pde/judge\"\nfilter_prompt=\"Decide.\"\n\
+             [tasks.chat_output_filter]\nmodel=\"fast/m\"\nfilter_prompt=\"Rewrite.\"\n",
+            )
+            .unwrap(),
+        );
+        state.openrouter = std::sync::Arc::new(
+            eros_engine_llm::openrouter::OpenRouterClient::with_base_url(
+                "test-key".into(),
+                format!("{}/api/v1/chat/completions", mock.uri()),
+            ),
+        );
+        let token = mint_jwt(user_id);
+        let send = || {
+            stream_send(
+                session_id,
+                &token,
+                json!({
+                    "content": "你在想什么", "client_msg_id": "01JPA0000000000000000000SS",
+                }),
+                &[],
+            )
+        };
+        let mut app = build_router(state.clone());
+        let frames_from_body = |bytes: &[u8]| {
+            std::str::from_utf8(bytes)
+                .unwrap()
+                .lines()
+                .filter_map(|line| line.strip_prefix("data: "))
+                .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                .collect::<Vec<_>>()
+        };
+        let resp = app.call(send()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let frames = frames_from_body(&to_bytes(resp.into_body(), 1024 * 1024).await.unwrap());
+        assert_eq!(
+            frames
+                .iter()
+                .filter_map(|f| f["type"].as_str())
+                .collect::<Vec<_>>(),
+            ["meta", "delta", "done", "meta", "delta", "done", "meta", "delta", "done", "final"]
+        );
+        assert_eq!(frames.last().unwrap()["filtered"], true);
+        let mut ids = Vec::new();
+        for (bubble, content) in frames.as_chunks::<3>().0.iter().zip(fragments) {
+            let id = bubble[0]["message_id"].as_str().unwrap();
+            ids.push(Uuid::from(ulid::Ulid::from_string(id).unwrap()));
+            assert_eq!(bubble[1]["message_id"], id);
+            assert_eq!(bubble[2]["message_id"], id);
+            assert_eq!(bubble[1]["content"], content);
+        }
+        assert!(frames[2]["usage"].is_null() && frames[5]["usage"].is_null());
+        assert_eq!(frames[8]["generation_id"], "chat-gen");
+        let rows: Vec<(Uuid, chrono::DateTime<chrono::Utc>)> = sqlx::query_as(
+            "SELECT id, sent_at FROM engine.chat_messages WHERE session_id = $1 AND role = 'assistant' ORDER BY sent_at",
+        ).bind(session_id).fetch_all(&pool).await.unwrap();
+        assert_eq!(rows.iter().map(|r| r.0).collect::<Vec<_>>(), ids);
+        assert!((rows[1].1 - rows[0].1).num_milliseconds() >= 450);
+        assert!((rows[2].1 - rows[1].1).num_milliseconds() >= 1600);
+
+        let resp = app.call(send()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let replay = frames_from_body(&to_bytes(resp.into_body(), 1024 * 1024).await.unwrap());
+        assert_eq!(&replay[..9], &frames[..9]);
+        let requests = mock.received_requests().await.unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|r| String::from_utf8_lossy(&r.body).contains("deepseek/x"))
+                .count(),
+            1
+        );
+        assert!(requests
+            .iter()
+            .any(|r| String::from_utf8_lossy(&r.body).contains("用一个空行分隔气泡")));
+
+        let async_session = ChatRepo { pool: &pool }
+            .create_session(user_id, instance_id)
+            .await
+            .unwrap()
+            .id;
+        let resp = app
+            .call(async_send(
+                async_session,
+                &token,
+                json!({
+                    "content": "你在想什么", "client_msg_id": "01JPA000000000000000000ASY",
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        let queue_id: Uuid =
+            sqlx::query_scalar("SELECT id FROM engine.chat_turn_queue WHERE session_id = $1")
+                .bind(async_session)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        assert_eq!(
+            crate::pipeline::chat_queue::drain_once(&state, &sem)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            wait_for_status(&pool, queue_id, &["done", "failed"]).await,
+            "done"
+        );
+        let async_rows: Vec<(String, chrono::DateTime<chrono::Utc>)> = sqlx::query_as(
+            "SELECT content, sent_at FROM engine.chat_messages WHERE session_id = $1 AND role = 'assistant' ORDER BY sent_at",
+        ).bind(async_session).fetch_all(&pool).await.unwrap();
+        assert_eq!(
+            async_rows.iter().map(|r| r.0.as_str()).collect::<Vec<_>>(),
+            fragments
+        );
+        assert!((async_rows[2].1 - async_rows[1].1).num_milliseconds() >= 1600);
+
+        let disconnected = ChatRepo { pool: &pool }
+            .create_session(user_id, instance_id)
+            .await
+            .unwrap()
+            .id;
+        let resp = app
+            .call(stream_send(
+                disconnected,
+                &token,
+                json!({
+                    "content": "你在想什么", "client_msg_id": "01JPA000000000000000000OFF",
+                }),
+                &[],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        drop(resp);
+        let queue_id: Uuid =
+            sqlx::query_scalar("SELECT id FROM engine.chat_turn_queue WHERE session_id = $1")
+                .bind(disconnected)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            wait_for_status(&pool, queue_id, &["done", "failed"]).await,
+            "done"
+        );
+        let contents: Vec<String> = sqlx::query_scalar(
+            "SELECT content FROM engine.chat_messages WHERE session_id = $1 AND role = 'assistant' ORDER BY sent_at",
+        ).bind(disconnected).fetch_all(&pool).await.unwrap();
+        assert_eq!(contents, fragments);
     }
 
     /// The decision row is written by a spawned task: poll every 50ms, up to

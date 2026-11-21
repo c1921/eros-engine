@@ -35,6 +35,8 @@ use crate::state::AppState;
 /// the optional tail of `StreamSendRequest`.
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub(crate) struct QueuedTurnParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub received_at: Option<chrono::DateTime<chrono::Utc>>,
     #[serde(default)]
     pub tier: Option<String>,
     #[serde(default)]
@@ -126,6 +128,7 @@ pub async fn send_message_async(
     Extension(AuthUser(user_id)): Extension<AuthUser>,
     Json(req): Json<StreamSendRequest>,
 ) -> Result<(StatusCode, Json<AsyncSendResponse>), AppError> {
+    let received_at = chrono::Utc::now();
     // The worker generates this turn and never holds a BYOK configuration
     // (spec 2026-10-08 §9.3).
     if req.byok.is_some() {
@@ -195,6 +198,7 @@ pub async fn send_message_async(
         .ok()
         .flatten();
     let params = serde_json::to_value(QueuedTurnParams {
+        received_at: Some(received_at),
         tier: req.tier.clone(),
         memory_scope: req.memory_scope,
         affinity_scope: req.affinity_scope,

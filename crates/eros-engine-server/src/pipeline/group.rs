@@ -726,6 +726,7 @@ pub(crate) fn run_group_turn(
                 Some(seat.member_session_id),
                 // A group turn draws no tone.
                 None,
+                false,
             );
             futures_util::pin_mut!(burst);
             let mut failed = false;

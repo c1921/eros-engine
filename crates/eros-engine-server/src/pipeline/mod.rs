@@ -14,6 +14,7 @@ pub mod post_process;
 pub mod proactive;
 pub mod profile_rebuild;
 pub mod reasoning_call;
+pub(crate) mod reply_pacing;
 pub mod snapshot;
 pub mod story;
 pub mod stream;

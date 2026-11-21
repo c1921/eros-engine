@@ -3590,7 +3590,7 @@ async fn build_input_filter_transcript(
     session_id: Uuid,
     current_user_message_id: Uuid,
 ) -> JudgeTranscript {
-    use super::reply_pacing::{logical_history_window, MAX_REPLY_BUBBLES};
+    use super::reply_pacing::{logical_history_window, HISTORY_ROWS_PER_TURN};
     // Anchored at the driving row: on the queue path a burst can land AFTER
     // it, and a newest-N fetch would show the judge rows from this turn's
     // future (with the row itself buried past the fetch, the exclusion below
@@ -3607,7 +3607,7 @@ async fn build_input_filter_transcript(
         .history_up_to(
             session_id,
             current_user_message_id,
-            (INPUT_FILTER_CONTEXT_TURNS + 1) * MAX_REPLY_BUBBLES,
+            (INPUT_FILTER_CONTEXT_TURNS + 1) * HISTORY_ROWS_PER_TURN,
         )
         .await
         .unwrap_or_default();
@@ -3622,11 +3622,11 @@ async fn build_input_filter_transcript(
 /// event's, spec 2026-10-26-event-message-image-design.md §4). Best-effort:
 /// empty on a DB error.
 pub(crate) async fn recent_transcript(chat_repo: &ChatRepo<'_>, session_id: Uuid) -> String {
-    use super::reply_pacing::{logical_history_window, MAX_REPLY_BUBBLES};
+    use super::reply_pacing::{logical_history_window, HISTORY_ROWS_PER_TURN};
     let rows = chat_repo
         .history(
             session_id,
-            INPUT_FILTER_CONTEXT_TURNS * MAX_REPLY_BUBBLES,
+            INPUT_FILTER_CONTEXT_TURNS * HISTORY_ROWS_PER_TURN,
             0,
         )
         .await

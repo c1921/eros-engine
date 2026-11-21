@@ -1077,8 +1077,8 @@ pub(crate) async fn build_reply_request_with(
             // prompt, and the model answers whatever comes last (#330). Rows
             // the burst's own turns will see are simply not this turn's
             // context yet.
-            use super::reply_pacing::{logical_history_window, MAX_REPLY_BUBBLES};
-            let fetch_limit = HISTORY_WINDOW * MAX_REPLY_BUBBLES;
+            use super::reply_pacing::{logical_history_window, HISTORY_ROWS_PER_TURN};
+            let fetch_limit = HISTORY_WINDOW * HISTORY_ROWS_PER_TURN;
             let mut rows = chat_repo
                 .history_up_to(session_id, user_message_id, fetch_limit)
                 .await?;
@@ -1100,7 +1100,7 @@ pub(crate) async fn build_reply_request_with(
                             .history_through(
                                 a.session_id,
                                 a.started_at.unwrap_or(a.created_at),
-                                room * MAX_REPLY_BUBBLES,
+                                room * HISTORY_ROWS_PER_TURN,
                             )
                             .await?,
                         room,

@@ -86,10 +86,13 @@ pub(crate) async fn drain_once(
     // claim for up to generation_timeout, and reaping inside that window
     // releases a turn whose original drive is still running — a second claim
     // then drives it concurrently and the two ladders overwrite each other.
-    // claim_stale is the grace after generation and any staged delivery.
+    // claim_stale is the grace after generation and any staged delivery. The
+    // delivery half is `MAX_DELIVERY`, not the flat `DELIVERY_TIMEOUT`: with no
+    // bubble cap a long paced reply can spend well over ten seconds draining,
+    // and reaping that live drive would hand it to a second claim.
     let reaped = repo
         .reap_stale(
-            cfg.generation_timeout + reply_pacing::DELIVERY_TIMEOUT + cfg.claim_stale,
+            cfg.generation_timeout + reply_pacing::MAX_DELIVERY + cfg.claim_stale,
             cfg.max_attempts,
             FAILURE_NOTICE,
         )
@@ -271,7 +274,7 @@ async fn drive_turn(
     state: &AppState,
     turn: &ClaimedTurn,
     tap: Option<tokio::sync::mpsc::UnboundedSender<ProtocolFrame>>,
-    ready: tokio::sync::oneshot::Sender<()>,
+    ready: tokio::sync::oneshot::Sender<Option<usize>>,
 ) -> TurnOutcome {
     let chat_repo = ChatRepo { pool: &state.pool };
     let queue_repo = ChatQueueRepo { pool: &state.pool };
@@ -281,7 +284,7 @@ async fn drive_turn(
     };
     match queue_repo.has_staged_reply(turn.user_message_id).await {
         Ok(true) => {
-            let _ = ready.send(());
+            let _ = ready.send(None);
             loop {
                 match reply_pacing::next_bubble(&queue_repo, claim).await {
                     Ok(Some(_)) => {}

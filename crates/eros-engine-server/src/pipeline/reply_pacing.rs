@@ -14,12 +14,21 @@ use ulid::Ulid;
 use super::stream::{ulid_string, FrameActionType, ProtocolFrame, StreamErrorCode};
 
 pub(crate) const DELIVERY_TIMEOUT: Duration = Duration::from_secs(10);
-pub(super) const MAX_REPLY_BUBBLES: i64 = 3;
+/// Splitting has no bubble cap, so the drain deadline has to grow with the
+/// staged bubble count instead of being the flat `DELIVERY_TIMEOUT`: a reply
+/// of up to three bubbles keeps the old deadline, longer ones get
+/// `2s + 2.5s` per bubble, and the ceiling is also the claim-reap grace.
+pub(crate) const MAX_DELIVERY: Duration = Duration::from_secs(45);
+/// One logical assistant turn can now be an unbounded run of bubbles, so the
+/// row fetch feeding `logical_history_window` is over-provisioned. A turn that
+/// used more bubbles than this simply ends up with a shorter window.
+pub(super) const HISTORY_ROWS_PER_TURN: i64 = 6;
 pub(super) const INDEX_METADATA_KEY: &str = "reply_bubble_index";
 /// Appended to the chat prompt when pacing is on. Deliberately imperative: the
 /// earlier "可以…也可以…" wording let the model collapse every reply into one
-/// bubble, so pacing was enabled but never exercised.
-pub(super) const REPLY_PROMPT: &str = "\n\n像平常发消息一样：除非只有一句话，否则请在自然停顿处分成两到三条气泡，用空行分隔；同一句话可以跨气泡接着说。每条气泡的末尾不要加句号。整轮遵守上面的语气要求。";
+/// bubble, so pacing was enabled but never exercised. It names no bubble count
+/// on purpose — the split below takes as many bubbles as the wording yields.
+pub(super) const REPLY_PROMPT: &str = "\n\n像平常发消息一样：除非只有一句话，否则请在自然停顿处分成几条气泡，用空行分隔，不要为了条数硬拆；同一句话可以跨气泡接着说。每条气泡的末尾不要加句号。整轮遵守上面的语气要求。";
 pub(super) const FILTER_PROMPT: &str =
     "\n\n如果原回复用空行分隔了聊天气泡，尽量保留有意义的分隔，继续用空行分隔气泡。";
 
@@ -27,7 +36,7 @@ pub(crate) struct ReplyPacing {
     pub(crate) claim: ReplyDeliveryClaim,
     received_before_start: Duration,
     started_at: Instant,
-    ready: oneshot::Sender<()>,
+    ready: oneshot::Sender<Option<usize>>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -49,7 +58,7 @@ impl ReplyPacing {
     pub(crate) fn new(
         claim: ReplyDeliveryClaim,
         received_at: chrono::DateTime<chrono::Utc>,
-        ready: oneshot::Sender<()>,
+        ready: oneshot::Sender<Option<usize>>,
     ) -> Self {
         Self {
             claim,
@@ -69,33 +78,54 @@ impl ReplyPacing {
     ) -> Result<(), sqlx::Error> {
         let elapsed = self.received_before_start + self.started_at.elapsed();
         let bubbles = schedule_bubbles(row, model, elapsed);
+        // The staged bubble count sets the delivery budget the drive above is
+        // timed with, so it has to travel back with the ready signal.
+        let bubbles_staged = bubbles.len();
         repo.stage_reply(self.claim, &bubbles).await?;
-        let _ = self.ready.send(());
+        let _ = self.ready.send(Some(bubbles_staged));
         Ok(())
+    }
+}
+
+/// Delivery deadline for a staged reply: the flat `DELIVERY_TIMEOUT` floor (up
+/// to three bubbles behave exactly as before), then 2.5s per bubble over a 2s
+/// base, capped at `MAX_DELIVERY`. `None` means the bubble count is not in hand.
+fn delivery_budget(bubbles: Option<usize>) -> Duration {
+    match bubbles {
+        Some(count) => (Duration::from_secs(2) + Duration::from_millis(2500) * count as u32)
+            .clamp(DELIVERY_TIMEOUT, MAX_DELIVERY),
+        // A resumed delivery publishes rows staged by the drive that died, so
+        // its bubble count is not in hand: allow the full ceiling.
+        None => MAX_DELIVERY,
     }
 }
 
 pub(crate) async fn with_deadline<T>(
     generation_timeout: Duration,
-    drive: impl AsyncFnOnce(oneshot::Sender<()>) -> T,
+    drive: impl AsyncFnOnce(oneshot::Sender<Option<usize>>) -> T,
 ) -> Result<T, DriveTimeout> {
     let (ready, mut delivery) = oneshot::channel();
     let drive = drive(ready);
     tokio::pin!(drive);
+    let mut budget = DELIVERY_TIMEOUT;
     let generated = tokio::time::timeout(generation_timeout, async {
         tokio::select! {
             biased;
             result = &mut drive => Some(result),
-            signal = &mut delivery => {
-                if signal.is_ok() { None } else { Some((&mut drive).await) }
-            }
+            signal = &mut delivery => match signal {
+                Ok(bubbles) => {
+                    budget = delivery_budget(bubbles);
+                    None
+                }
+                Err(_) => Some((&mut drive).await),
+            },
         }
     })
     .await
     .map_err(|_| DriveTimeout::Generation)?;
     match generated {
         Some(result) => Ok(result),
-        None => tokio::time::timeout(DELIVERY_TIMEOUT, drive)
+        None => tokio::time::timeout(budget, drive)
             .await
             .map_err(|_| DriveTimeout::Delivery),
     }
@@ -230,7 +260,7 @@ fn split_bubbles(text: &str) -> Vec<&str> {
     let mut end = 0;
     for line in text.split_inclusive('\n') {
         let next = end + line.len();
-        if parts.len() < MAX_REPLY_BUBBLES as usize - 1 && line.trim().is_empty() {
+        if line.trim().is_empty() {
             let part = text[start..end].trim();
             if !part.is_empty() {
                 parts.push(part);
@@ -336,9 +366,30 @@ mod tests {
         );
         assert_eq!(
             split_bubbles("一\n二\n\n三\n\n四\n\n五"),
-            ["一\n二", "三", "四\n\n五"]
+            ["一\n二", "三", "四", "五"]
         );
         assert!(split_bubbles(" \r\n\n").is_empty());
+    }
+
+    #[test]
+    fn splits_without_a_bubble_cap() {
+        let text = (0..40)
+            .map(|i| format!("第{i}条"))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let parts = split_bubbles(&text);
+        assert_eq!(parts.len(), 40);
+        assert_eq!(parts.first().copied(), Some("第0条"));
+        assert_eq!(parts.last().copied(), Some("第39条"));
+    }
+
+    #[test]
+    fn delivery_budget_keeps_the_floor_and_grows_with_bubbles() {
+        let ms = Duration::from_millis;
+        assert_eq!(delivery_budget(Some(1)), DELIVERY_TIMEOUT);
+        assert_eq!(delivery_budget(Some(3)), DELIVERY_TIMEOUT);
+        assert_eq!(delivery_budget(Some(5)), ms(2000 + 2500 * 5));
+        assert_eq!(delivery_budget(Some(200)), MAX_DELIVERY);
     }
 
     #[test]
@@ -399,7 +450,7 @@ mod tests {
         assert_eq!(
             with_deadline(ms(100), async |ready| {
                 tokio::time::sleep(ms(90)).await;
-                ready.send(()).unwrap();
+                ready.send(Some(1)).unwrap();
                 tokio::time::sleep(ms(350)).await;
                 42
             })
@@ -416,7 +467,7 @@ mod tests {
         );
         assert_eq!(
             with_deadline(ms(100), async |ready| {
-                ready.send(()).unwrap();
+                ready.send(Some(1)).unwrap();
                 tokio::time::sleep(DELIVERY_TIMEOUT + ms(1)).await;
             })
             .await,

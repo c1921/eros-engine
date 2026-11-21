@@ -61,10 +61,12 @@ ssh beijing-01 'sudo cp /tmp/deploy.sh /etc/snikket-eros/ && sudo /etc/snikket-e
 
 - `false` = 启用。引擎在 system 消息末尾追加 `REPLY_PROMPT`
   （`crates/eros-engine-server/src/pipeline/reply_pacing.rs`），要求模型在自然停顿处
-  用空行分成 2–3 条、且气泡末尾不加句号；然后按空行拆、按字数算节奏逐条落库与发送。
+  用空行分条、且气泡末尾不加句号；然后按空行拆、按字数算节奏逐条落库与发送。
 - `true` = 关闭，退回单条整段回复。
-- 拆分上限是 `MAX_REPLY_BUBBLES = 3`（引擎侧）。客户端（bridge / 微信插件）虽然允许 5 条，
-  但永远触发不到。
+- 分段**没有条数上限**：空行有几段就拆几段。随之放开的还有两处时间约束——
+  发送截止时间按气泡数放大（`delivery_budget`：2s + 每气泡 2.5s，下限 10s、
+  上限 `MAX_DELIVERY = 45s`），队列的过期回收窗口也用这个上限。
+  客户端（bridge / 微信插件）同样不再限制条数，只保留单条文本的字节上限。
 
 ## 提示词日志（`PROMPT_LOG_DIR`）
 

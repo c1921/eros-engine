@@ -1,0 +1,31 @@
+services:
+  postgres:
+    image: ${EROS_POSTGRES_IMAGE:?PostgreSQL image required}
+    env_file: db.env
+    ports:
+      - '127.0.0.1:55432:5432'
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: [CMD, pg_isready, -U, eros, -d, eros]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    mem_limit: 384m
+    restart: unless-stopped
+  engine:
+    image: c1921/eros-engine:59a65db
+    network_mode: host
+    env_file: engine.env
+    volumes:
+      - ./model.toml:/etc/eros-engine/snikket-model.toml:ro
+      - ./personas:/etc/eros-engine/snikket-personas:ro
+      - ./prompt-logs:/var/log/eros-prompts
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: [serve]
+    mem_limit: 384m
+    restart: unless-stopped
+volumes:
+  pgdata:

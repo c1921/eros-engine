@@ -1,0 +1,20 @@
+[defaults]
+fallback_model = "deepseek-v4.1-flash:1017@ollama"
+fallback_max_tokens = 2048
+
+[providers.ollama]
+chat = "http://127.0.0.1:18081/v1/chat/completions"
+
+[providers.local]
+embeddings = "http://127.0.0.1:18081/v1/embeddings"
+
+[tasks.chat_companion]
+model = "deepseek-v4.1-flash:1017@ollama"
+temperature = 0.5
+max_tokens = 2048
+
+[tasks.pde_decision]
+ghosting = false
+
+[tasks.embedding]
+model = "BAAI/bge-small-zh-v1.5@local"

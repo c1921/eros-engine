@@ -16,7 +16,10 @@ use super::stream::{ulid_string, FrameActionType, ProtocolFrame, StreamErrorCode
 pub(crate) const DELIVERY_TIMEOUT: Duration = Duration::from_secs(10);
 pub(super) const MAX_REPLY_BUBBLES: i64 = 3;
 pub(super) const INDEX_METADATA_KEY: &str = "reply_bubble_index";
-pub(super) const REPLY_PROMPT: &str = "\n\n像平常发消息一样，可以发一条，也可以在自然停顿处分为两到三条气泡。同一句话也可以跨气泡接着说。用一个空行分隔气泡。很短的回复可以只发一条。整轮遵守上面的语气和长度要求。";
+/// Appended to the chat prompt when pacing is on. Deliberately imperative: the
+/// earlier "可以…也可以…" wording let the model collapse every reply into one
+/// bubble, so pacing was enabled but never exercised.
+pub(super) const REPLY_PROMPT: &str = "\n\n像平常发消息一样：除非只有一句话，否则请在自然停顿处分成两到三条气泡，用空行分隔；同一句话可以跨气泡接着说。每条气泡的末尾不要加句号。整轮遵守上面的语气要求。";
 pub(super) const FILTER_PROMPT: &str =
     "\n\n如果原回复用空行分隔了聊天气泡，尽量保留有意义的分隔，继续用空行分隔气泡。";
 

@@ -14,7 +14,7 @@ services:
     mem_limit: 384m
     restart: unless-stopped
   engine:
-    image: c1921/eros-engine:59a65db
+    image: c1921/eros-engine:966776e
     network_mode: host
     env_file: engine.env
     volumes:
